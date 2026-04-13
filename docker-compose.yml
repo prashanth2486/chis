@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: pattern_prediction_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - CORS_ALLOWED_ORIGINS=http://localhost:8501,http://127.0.0.1:8501
+      - JWT_SECRET_KEY=change-me-in-production
+      - DEFAULT_ADMIN_PASSWORD=admin123
+    volumes:
+      - ./backend/data:/app/data
+    restart: always
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: pattern_prediction_frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - PATTERN_PREDICTION_API_URL=http://backend:8000
+    depends_on:
+      - backend
+    restart: always
