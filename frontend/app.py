@@ -46,7 +46,7 @@ else:
 
     # Determine available pages based on role
     PAGES = {"HOME": "🏠 Home"}
-    
+
     role = st.session_state['user_role']
     if role == "admin":
         PAGES["PREDICTION"] = "💊 Prediction System"
@@ -58,10 +58,10 @@ else:
     elif role == "doctor":
         PAGES["PREDICTION"] = "💊 Prediction System"
         PAGES["DOCTOR"] = "🩺 Doctor Dashboard"
-        
+
     selected_page = st.radio(
-        "Navigation", 
-        options=list(PAGES.values()), 
+        "Navigation",
+        options=list(PAGES.values()),
         horizontal=True,
         label_visibility="collapsed"
     )

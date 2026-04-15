@@ -6,7 +6,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 
-pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt", "pbkdf2_sha256"], deprecated="auto")
 
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-me-in-production")
 JWT_ALGORITHM = "HS256"
@@ -23,10 +23,10 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def is_hashed_password(value: str) -> bool:
     return (
-        value.startswith("$pbkdf2-sha256$")
-        or value.startswith("$2a$")
+        value.startswith("$2a$")
         or value.startswith("$2b$")
         or value.startswith("$2y$")
+        or value.startswith("$pbkdf2-sha256$")
     )
 
 

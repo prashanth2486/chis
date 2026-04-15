@@ -2,25 +2,31 @@ from datetime import UTC, datetime
 import io
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
-from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Query as FastAPIQuery
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy import text
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 
 import models
 from database import engine, get_db
 from services.eclat_service import compute_frequent_patterns
 from services.prediction_service import PredictionService
+from services.clinical_service import build_prescription_guidance, normalize_symptoms, season_from_date, severity_from_query_text, severity_from_symptoms
 from auth import create_access_token, decode_access_token, hash_password, is_hashed_password, verify_password
+from config import settings
+from observability import setup_observability
+from api_models import EclatRunResponse, GenericMessageResponse, HealthResponse, LoginResponse, PredictResponse, ReadyResponse, RootResponse
 
-app = FastAPI(title="Cattle Disease Pattern Prediction API")
+app = FastAPI(title=settings.app_name)
 
-cors_origins = [origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:8501,http://127.0.0.1:8501").split(",") if origin.strip()]
+cors_origins = [origin.strip() for origin in settings.cors_allowed_origins.split(",") if origin.strip()]
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +35,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+setup_observability(app)
 
 prediction_service = PredictionService()
 UPLOADS_DIR = Path(__file__).resolve().parent / "uploads" / "lab_reports"
@@ -64,6 +71,86 @@ def _ensure_owner_or_role(requested_user_id: str, current_user: dict, allowed_ro
         raise HTTPException(status_code=403, detail="You can access only your own records")
 
 
+RBAC_RULES = {
+    "/users": {"admin", "doctor"},
+    "/analytics": {"admin"},
+    "/admin": {"admin"},
+    "/doctor": {"doctor", "admin"},
+    "/case-sheets": {"doctor", "admin", "farmer"},
+    "/cattle": {"doctor", "admin", "farmer"},
+    "/predict": {"farmer", "doctor", "admin"},
+    "/symptoms": {"farmer", "doctor", "admin"},
+    "/queries": {"farmer", "doctor", "admin"},
+    "/history": {"farmer", "doctor", "admin"},
+    "/eclat": {"doctor", "admin"},
+    "/follow-ups": {"doctor", "admin"},
+    "/preventive-care": {"doctor", "admin"},
+    "/lab-reports": {"doctor", "admin"},
+}
+
+
+@app.middleware("http")
+async def rbac_guard_middleware(request, call_next):
+    path = request.url.path
+
+    if path in {"/", "/health", "/ready", "/login", "/register/farmer", "/register/vdoctor", "/docs", "/openapi.json", "/redoc"}:
+        return await call_next(request)
+
+    required_roles = None
+    for prefix, roles in RBAC_RULES.items():
+        if path.startswith(prefix):
+            required_roles = roles
+            break
+
+    if not required_roles:
+        return await call_next(request)
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "status_code": 401,
+                    "message": "Missing bearer token",
+                    "details": None,
+                    "request_id": getattr(request.state, "request_id", ""),
+                }
+            },
+        )
+
+    token = auth_header.replace("Bearer ", "", 1)
+    payload = decode_access_token(token)
+    if not payload:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "status_code": 401,
+                    "message": "Invalid or expired token",
+                    "details": None,
+                    "request_id": getattr(request.state, "request_id", ""),
+                }
+            },
+        )
+
+    role = payload.get("role", "")
+    if role not in required_roles:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "status_code": 403,
+                    "message": "Access denied for this role",
+                    "details": None,
+                    "request_id": getattr(request.state, "request_id", ""),
+                }
+            },
+        )
+
+    return await call_next(request)
+
+
 def initialize_database() -> None:
     try:
         with Session(engine) as db:
@@ -80,12 +167,27 @@ def initialize_database() -> None:
 
 initialize_database()
 
-@app.get("/")
+@app.get("/", response_model=RootResponse)
 def read_root():
     return {"message": "Welcome to the Cattle Disease Pattern Prediction API"}
 
-@app.post("/predict")
-def predict_disease(symptoms: str):
+@app.get("/health", response_model=HealthResponse)
+def health_check():
+    return {"status": "ok", "service": settings.app_name, "env": settings.app_env}
+
+
+@app.get("/ready", response_model=ReadyResponse)
+def readiness_check(db: Session = Depends(get_db)):
+    db.execute(text("SELECT 1"))
+    uploads_ok = UPLOADS_DIR.exists()
+    return {"status": "ready", "database": "ok", "uploads": "ok" if uploads_ok else "missing"}
+
+
+@app.post("/predict", response_model=PredictResponse)
+def predict_disease(
+    symptoms: str = FastAPIQuery(..., min_length=2, max_length=2000),
+    current_user: dict = Depends(require_roles("farmer", "doctor", "admin")),
+):
     disease = prediction_service.predict_disease(symptoms)
     treatment = prediction_service.get_treatment(disease)
     return {
@@ -94,11 +196,11 @@ def predict_disease(symptoms: str):
         "recommended_treatment": treatment
     }
 
-@app.post("/eclat/run", summary="Run Eclat algorithm on uploaded Excel file")
+@app.post("/eclat/run", response_model=EclatRunResponse, summary="Run Eclat algorithm on uploaded Excel file")
 async def run_eclat(
     file: UploadFile = File(...),
-    min_support: float = 0.04,
-    min_confidence: float = 0.5,
+    min_support: float = FastAPIQuery(0.04, ge=0.001, le=1.0),
+    min_confidence: float = FastAPIQuery(0.5, ge=0.1, le=1.0),
     current_user: dict = Depends(require_roles("admin", "doctor")),
 ):
     """
@@ -152,88 +254,99 @@ async def run_eclat(
 
 # --- Pydantic Schemas ---
 class HistoryCreate(BaseModel):
-    farmer_id: str
-    description: str
-    symptoms: str
-    disease: str
-    treatments: str
+    farmer_id: str = Field(..., min_length=2, max_length=64)
+    description: str = Field(..., min_length=2, max_length=200)
+    symptoms: str = Field(..., min_length=2, max_length=2000)
+    disease: str = Field(..., min_length=2, max_length=120)
+    treatments: str = Field(..., min_length=2, max_length=2000)
 
 class QueryCreate(BaseModel):
-    farmer_id: str
-    query_text: str
+    farmer_id: str = Field(..., min_length=2, max_length=64)
+    query_text: str = Field(..., min_length=5, max_length=2000)
 
 class QueryReply(BaseModel):
-    reply_text: str
+    reply_text: str = Field(..., min_length=2, max_length=2000)
 
 class FarmerRegister(BaseModel):
-    farmer_id: str
-    password: str
-    name: str
-    contact_no: str
-    address: str
+    farmer_id: str = Field(..., min_length=2, max_length=64)
+    password: str = Field(..., min_length=6, max_length=128)
+    name: str = Field(..., min_length=2, max_length=120)
+    contact_no: str = Field(..., min_length=6, max_length=32)
+    address: str = Field(..., min_length=5, max_length=300)
 
 class DoctorRegister(BaseModel):
-    ic_id: str
-    password: str
-    name: str
-    address: str
-    contact_no: str
-    email_id: str
-    city_name: str  # Send city name and map to city_id
+    ic_id: str = Field(..., min_length=2, max_length=64)
+    password: str = Field(..., min_length=6, max_length=128)
+    name: str = Field(..., min_length=2, max_length=120)
+    address: str = Field(..., min_length=5, max_length=300)
+    contact_no: str = Field(..., min_length=6, max_length=32)
+    email_id: EmailStr
+    city_name: str = Field(..., min_length=2, max_length=120)  # Send city name and map to city_id
 
 class UserLogin(BaseModel):
-    user_id: str
-    password: str
-    role: str # "farmer", "doctor", "admin"
-
+    user_id: str = Field(..., min_length=2, max_length=64)
+    password: str = Field(..., min_length=1, max_length=128)
+    role: str = Field(..., pattern="^(farmer|doctor|admin)$")
 
 class CattleProfileCreate(BaseModel):
-    farmer_id: str
-    animal_tag: str
-    animal_name: str
-    breed: str
-    age_years: Optional[float] = None
-    weight_kg: Optional[float] = None
-    gender: str
-    pregnancy_status: str = "not_applicable"
-    milk_yield_liters: Optional[float] = None
-    village: str = ""
-    notes: str = ""
+    farmer_id: str = Field(..., min_length=2, max_length=64)
+    animal_tag: str = Field(..., min_length=1, max_length=64)
+    animal_name: str = Field(..., min_length=1, max_length=120)
+    breed: str = Field(..., min_length=1, max_length=120)
+    age_years: Optional[float] = Field(None, ge=0, le=40)
+    weight_kg: Optional[float] = Field(None, ge=0, le=2000)
+    gender: str = Field(..., pattern="^(female|male)$")
+    pregnancy_status: str = Field("not_applicable", pattern="^(not_applicable|pregnant|not_pregnant|unknown)$")
+    milk_yield_liters: Optional[float] = Field(None, ge=0, le=200)
+    village: str = Field("", max_length=120)
+    notes: str = Field("", max_length=2000)
 
 
 class CaseSheetCreate(BaseModel):
-    cattle_id: int
-    farmer_id: str
-    doctor_id: str
-    symptoms: str
-    diagnosis: str
-    confirmed_disease: Optional[str] = None
-    treatment: str
-    dosage_notes: str = ""
+    cattle_id: int = Field(..., ge=1)
+    farmer_id: str = Field(..., min_length=2, max_length=64)
+    doctor_id: str = Field(..., min_length=2, max_length=64)
+    symptoms: str = Field(..., min_length=2, max_length=2000)
+    diagnosis: str = Field(..., min_length=2, max_length=120)
+    confirmed_disease: Optional[str] = Field(None, max_length=120)
+    treatment: str = Field(..., min_length=2, max_length=3000)
+    dosage_notes: str = Field("", max_length=2000)
     follow_up_date: Optional[datetime] = None
-    notes: str = ""
-    recovery_progress: str = "under_treatment"
+    notes: str = Field("", max_length=3000)
+    recovery_progress: str = Field("under_treatment", pattern="^(under_treatment|stable|improving|critical|recovered)$")
     emergency_flag: bool = False
-    case_status: str = "open"
+    case_status: str = Field("open", pattern="^(open|under_review|closed)$")
 
 
 class QueryTriageUpdate(BaseModel):
-    doctor_id: str
-    priority: str = "normal"
-    status: str = "pending"
+    doctor_id: str = Field(..., min_length=2, max_length=64)
+    priority: str = Field("normal", pattern="^(normal|urgent|critical)$")
+    status: str = Field("pending", pattern="^(pending|answered|follow_up_needed|closed)$")
     follow_up_needed: bool = False
-    notes: str = ""
+    notes: str = Field("", max_length=2000)
+
+
+class CaseOutcomeUpdate(BaseModel):
+    outcome_status: str = Field(..., pattern="^(pending|improving|resolved|failed)$")
+    outcome_notes: str = Field("", max_length=2000)
+    resolved_at: Optional[datetime] = None
 
 
 class PreventiveCareCreate(BaseModel):
-    cattle_id: int
-    farmer_id: str
-    care_type: str
-    item_name: str
+    cattle_id: int = Field(..., ge=1)
+    farmer_id: str = Field(..., min_length=2, max_length=64)
+    care_type: str = Field(..., pattern="^(vaccination|deworming|other)$")
+    item_name: str = Field(..., min_length=2, max_length=120)
     due_date: datetime
     completed_date: Optional[datetime] = None
-    status: str = "scheduled"
-    notes: str = ""
+    status: str = Field("scheduled", pattern="^(scheduled|completed|missed)$")
+    notes: str = Field("", max_length=2000)
+
+
+class DemoSeedResponse(BaseModel):
+    message: str
+    created: dict[str, int]
+    existing: dict[str, int]
 
 
 def serialize_cattle(cattle: models.CattleProfile) -> dict:
@@ -262,13 +375,21 @@ def serialize_case_sheet(case: models.CaseSheet, cattle: Optional[models.CattleP
         "doctor_id": case.doctor_id,
         "visit_date": case.visit_date,
         "symptoms": case.symptoms,
+        "normalized_symptoms": case.normalized_symptoms,
         "diagnosis": case.diagnosis,
+        "predicted_disease": case.predicted_disease,
         "confirmed_disease": case.confirmed_disease,
         "treatment": case.treatment,
         "dosage_notes": case.dosage_notes,
         "follow_up_date": case.follow_up_date,
         "notes": case.notes,
         "recovery_progress": case.recovery_progress,
+        "outcome_status": case.outcome_status,
+        "outcome_notes": case.outcome_notes,
+        "resolved_at": case.resolved_at,
+        "severity_score": case.severity_score,
+        "escalation_level": case.escalation_level,
+        "data_quality_flags": case.data_quality_flags,
         "emergency_flag": case.emergency_flag,
         "case_status": case.case_status,
         "animal_tag": cattle.animal_tag if cattle else None,
@@ -309,8 +430,8 @@ def serialize_lab_report(report: models.LabReport, cattle: Optional[models.Cattl
 
 # --- Endpoints ---
 
-@app.get("/symptoms")
-def get_symptoms():
+@app.get("/symptoms", response_model=dict[str, list[str]])
+def get_symptoms(current_user: dict = Depends(require_roles("farmer", "doctor", "admin"))):
     from services.prediction_service import PredictionService
     return {"symptoms": sorted(list(PredictionService.SYMPTOMS))}
 
@@ -329,11 +450,11 @@ def add_history(history: HistoryCreate, db: Session = Depends(get_db), current_u
     db.refresh(db_item)
     return db_item
 
-@app.get("/history/{farmer_id}")
-def get_history(farmer_id: str, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+@app.get("/history/{farmer_id}", response_model=list[dict[str, Any]])
+def get_history(farmer_id: str, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user), limit: int = FastAPIQuery(50, ge=1, le=200), offset: int = FastAPIQuery(0, ge=0)):
     _ensure_owner_or_role(farmer_id, current_user, {"doctor", "admin"})
-    records = db.query(models.History).filter(models.History.farmer_id == farmer_id).order_by(models.History.date.desc()).all()
-    return records
+    records = db.query(models.History).filter(models.History.farmer_id == farmer_id).order_by(models.History.date.desc()).offset(offset).limit(limit).all()
+    return [{"id": item.id, "farmer_id": item.farmer_id, "description": item.description, "symptoms": item.symptoms, "disease": item.disease, "treatments": item.treatments, "date": item.date} for item in records]
 
 @app.post("/queries")
 def add_query(query: QueryCreate, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
@@ -347,15 +468,15 @@ def add_query(query: QueryCreate, db: Session = Depends(get_db), current_user: d
     db.refresh(db_item)
     return db_item
 
-@app.get("/queries")
-def get_all_queries(farmer_id: Optional[str] = None, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+@app.get("/queries", response_model=list[dict[str, Any]])
+def get_all_queries(farmer_id: Optional[str] = None, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user), limit: int = FastAPIQuery(50, ge=1, le=200), offset: int = FastAPIQuery(0, ge=0)):
     if current_user["role"] == "farmer":
         farmer_id = current_user["user_id"]
     query = db.query(models.Query)
     if farmer_id:
         query = query.filter(models.Query.farmer_id == farmer_id)
-    records = query.order_by(models.Query.query_date.desc()).all()
-    return records
+    records = query.order_by(models.Query.query_date.desc()).offset(offset).limit(limit).all()
+    return [{"id": item.id, "farmer_id": item.farmer_id, "query_text": item.query_text, "query_date": item.query_date, "reply_text": item.reply_text, "reply_date": item.reply_date} for item in records]
 
 @app.post("/queries/{query_id}/reply")
 def reply_query(query_id: int, reply: QueryReply, db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin"))):
@@ -372,7 +493,7 @@ def reply_query(query_id: int, reply: QueryReply, db: Session = Depends(get_db),
 
 # --- Auth Endpoints ---
 
-@app.post("/register/farmer")
+@app.post("/register/farmer", response_model=GenericMessageResponse)
 def register_farmer(farmer: FarmerRegister, db: Session = Depends(get_db)):
     # Check if exists
     if db.query(models.Farmer).filter(models.Farmer.farmer_id == farmer.farmer_id).first():
@@ -390,7 +511,7 @@ def register_farmer(farmer: FarmerRegister, db: Session = Depends(get_db)):
     db.refresh(db_item)
     return {"message": "Farmer registered successfully."}
 
-@app.post("/register/vdoctor")
+@app.post("/register/vdoctor", response_model=GenericMessageResponse)
 def register_doctor(doctor: DoctorRegister, db: Session = Depends(get_db)):
     if db.query(models.VDoctor).filter(models.VDoctor.ic_id == doctor.ic_id).first():
         raise HTTPException(status_code=400, detail="Doctor IC ID already registered")
@@ -417,7 +538,7 @@ def register_doctor(doctor: DoctorRegister, db: Session = Depends(get_db)):
     db.refresh(db_item)
     return {"message": "Doctor registered successfully."}
 
-@app.post("/login")
+@app.post("/login", response_model=LoginResponse)
 def login(creds: UserLogin, db: Session = Depends(get_db)):
     user = None
     stored_password = None
@@ -441,6 +562,9 @@ def login(creds: UserLogin, db: Session = Depends(get_db)):
     password_ok = False
     if is_hashed_password(stored_password):
         password_ok = verify_password(creds.password, stored_password)
+        if password_ok and stored_password.startswith("$pbkdf2-sha256$"):
+            user.password = hash_password(creds.password)
+            db.commit()
     else:
         password_ok = creds.password == stored_password
         if password_ok:
@@ -460,8 +584,8 @@ def login(creds: UserLogin, db: Session = Depends(get_db)):
         "token_type": "bearer",
     }
 
-@app.get("/users")
-def get_users(db: Session = Depends(get_db), current_user: dict = Depends(require_roles("admin"))):
+@app.get("/users", response_model=dict[str, list[dict[str, str]]])
+def get_users(db: Session = Depends(get_db), current_user: dict = Depends(require_roles("admin", "doctor"))):
     farmers = db.query(models.Farmer).all()
     doctors = db.query(models.VDoctor).all()
     
@@ -480,48 +604,76 @@ def create_cattle_profile(payload: CattleProfileCreate, db: Session = Depends(ge
     return serialize_cattle(db_item)
 
 
-@app.get("/cattle")
-def get_cattle_profiles(farmer_id: Optional[str] = None, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+@app.get("/cattle", response_model=list[dict[str, Any]])
+def get_cattle_profiles(farmer_id: Optional[str] = None, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user), limit: int = FastAPIQuery(100, ge=1, le=500), offset: int = FastAPIQuery(0, ge=0)):
     if current_user["role"] == "farmer":
         farmer_id = current_user["user_id"]
     query = db.query(models.CattleProfile)
     if farmer_id:
         query = query.filter(models.CattleProfile.farmer_id == farmer_id)
-    cattle = query.order_by(models.CattleProfile.created_at.desc()).all()
+    cattle = query.order_by(models.CattleProfile.created_at.desc()).offset(offset).limit(limit).all()
     return [serialize_cattle(item) for item in cattle]
 
 
 @app.post("/case-sheets")
 def create_case_sheet(payload: CaseSheetCreate, db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin"))):
-    case = models.CaseSheet(**payload.model_dump())
+    cattle = db.query(models.CattleProfile).filter(models.CattleProfile.id == payload.cattle_id).first()
+    if not cattle:
+        raise HTTPException(status_code=404, detail="Cattle profile not found")
+
+    normalized_symptoms, unknown_symptoms = normalize_symptoms(payload.symptoms, PredictionService.SYMPTOMS)
+    predicted_disease = prediction_service.predict_disease(normalized_symptoms or payload.symptoms)
+    severity_score, escalation_level = severity_from_symptoms(normalized_symptoms or payload.symptoms)
+
+    case_data = payload.model_dump()
+    case_data["normalized_symptoms"] = normalized_symptoms
+    case_data["predicted_disease"] = predicted_disease
+    case_data["severity_score"] = severity_score
+    case_data["escalation_level"] = escalation_level
+    case_data["emergency_flag"] = payload.emergency_flag or escalation_level in {"high", "critical"}
+    case_data["data_quality_flags"] = ",".join(unknown_symptoms) if unknown_symptoms else ""
+
+    case = models.CaseSheet(**case_data)
     db.add(case)
     db.commit()
     db.refresh(case)
-    cattle = db.query(models.CattleProfile).filter(models.CattleProfile.id == case.cattle_id).first()
+
+    prescription_meta = build_prescription_guidance(
+        diagnosis=case.confirmed_disease or case.diagnosis,
+        treatment=case.treatment,
+        weight_kg=cattle.weight_kg,
+        pregnancy_status=cattle.pregnancy_status,
+    )
+
     return {
         "case_sheet": serialize_case_sheet(case, cattle),
         "prescription": {
             "animal": cattle.animal_name if cattle else "",
             "animal_tag": cattle.animal_tag if cattle else "",
+            "predicted_disease": predicted_disease,
+            "doctor_confirmed_disease": case.confirmed_disease,
             "diagnosis": case.confirmed_disease or case.diagnosis,
             "treatment": case.treatment,
             "dosage_notes": case.dosage_notes,
             "follow_up_date": case.follow_up_date,
+            **prescription_meta,
         },
     }
 
 
-@app.get("/case-sheets")
+@app.get("/case-sheets", response_model=list[dict[str, Any]])
 def get_case_sheets(
     cattle_id: Optional[int] = None,
     farmer_id: Optional[str] = None,
     symptoms: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    limit: int = FastAPIQuery(100, ge=1, le=500),
+    offset: int = FastAPIQuery(0, ge=0),
 ):
     if current_user["role"] == "farmer":
         farmer_id = current_user["user_id"]
-    cases = db.query(models.CaseSheet).order_by(models.CaseSheet.visit_date.desc()).all()
+    cases = db.query(models.CaseSheet).order_by(models.CaseSheet.visit_date.desc()).offset(offset).limit(limit).all()
     cattle_lookup = {item.id: item for item in db.query(models.CattleProfile).all()}
     symptom_tokens = {token.strip().lower() for token in symptoms.split(",")} if symptoms else set()
 
@@ -532,7 +684,7 @@ def get_case_sheets(
         if farmer_id and case.farmer_id != farmer_id:
             continue
         if symptom_tokens:
-            case_tokens = {token.strip().lower() for token in str(case.symptoms).split(",") if token.strip()}
+            case_tokens = {token.strip().lower() for token in str(case.normalized_symptoms or case.symptoms).split(",") if token.strip()}
             if not symptom_tokens.intersection(case_tokens):
                 continue
         results.append(serialize_case_sheet(case, cattle_lookup.get(case.cattle_id)))
@@ -557,13 +709,14 @@ def get_follow_ups(status: str = "all", db: Session = Depends(get_db), current_u
     return results
 
 
-@app.get("/doctor/queries")
-def get_doctor_queries(db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin"))):
-    queries = db.query(models.Query).order_by(models.Query.query_date.desc()).all()
+@app.get("/doctor/queries", response_model=list[dict[str, Any]])
+def get_doctor_queries(db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin")), limit: int = FastAPIQuery(100, ge=1, le=500), offset: int = FastAPIQuery(0, ge=0)):
+    queries = db.query(models.Query).order_by(models.Query.query_date.desc()).offset(offset).limit(limit).all()
     reviews = {item.query_id: item for item in db.query(models.QueryReview).all()}
     results = []
     for query in queries:
         review = reviews.get(query.id)
+        auto_score, auto_escalation = severity_from_query_text(query.query_text)
         results.append({
             "id": query.id,
             "farmer_id": query.farmer_id,
@@ -576,12 +729,20 @@ def get_doctor_queries(db: Session = Depends(get_db), current_user: dict = Depen
             "follow_up_needed": review.follow_up_needed if review else False,
             "doctor_notes": review.notes if review else "",
             "doctor_id": review.doctor_id if review else None,
+            "severity_score": review.severity_score if review and review.severity_score is not None else auto_score,
+            "escalation_level": review.escalation_level if review and review.escalation_level else auto_escalation,
         })
     return results
 
 
 @app.post("/doctor/queries/{query_id}/triage")
 def triage_query(query_id: int, payload: QueryTriageUpdate, db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin"))):
+    query_item = db.query(models.Query).filter(models.Query.id == query_id).first()
+    if not query_item:
+        raise HTTPException(status_code=404, detail="Query not found")
+
+    auto_score, auto_escalation = severity_from_query_text(query_item.query_text)
+
     review = db.query(models.QueryReview).filter(models.QueryReview.query_id == query_id).first()
     if not review:
         review = models.QueryReview(query_id=query_id, **payload.model_dump())
@@ -589,7 +750,14 @@ def triage_query(query_id: int, payload: QueryTriageUpdate, db: Session = Depend
     else:
         for key, value in payload.model_dump().items():
             setattr(review, key, value)
-        review.updated_at = datetime.now(UTC)
+
+    review.severity_score = auto_score
+    review.escalation_level = auto_escalation
+    if auto_escalation == "high":
+        review.priority = "critical" if review.priority == "critical" else "urgent"
+        review.follow_up_needed = True
+    review.updated_at = datetime.now(UTC)
+
     db.commit()
     db.refresh(review)
     return {
@@ -599,6 +767,8 @@ def triage_query(query_id: int, payload: QueryTriageUpdate, db: Session = Depend
         "follow_up_needed": review.follow_up_needed,
         "doctor_notes": review.notes,
         "doctor_id": review.doctor_id,
+        "severity_score": review.severity_score,
+        "escalation_level": review.escalation_level,
     }
 
 
@@ -652,17 +822,17 @@ async def upload_lab_report(
     return serialize_lab_report(report, cattle)
 
 
-@app.get("/lab-reports")
-def get_lab_reports(cattle_id: Optional[int] = None, db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin"))):
+@app.get("/lab-reports", response_model=list[dict[str, Any]])
+def get_lab_reports(cattle_id: Optional[int] = None, db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin")), limit: int = FastAPIQuery(100, ge=1, le=500), offset: int = FastAPIQuery(0, ge=0)):
     query = db.query(models.LabReport).order_by(models.LabReport.uploaded_at.desc())
     if cattle_id:
         query = query.filter(models.LabReport.cattle_id == cattle_id)
-    reports = query.all()
+    reports = query.offset(offset).limit(limit).all()
     cattle_lookup = {item.id: item for item in db.query(models.CattleProfile).all()}
     return [serialize_lab_report(item, cattle_lookup.get(item.cattle_id)) for item in reports]
 
 
-@app.get("/doctor/trends")
+@app.get("/doctor/trends", response_model=dict[str, dict[str, int]])
 def get_doctor_trends(db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin"))):
     cases = db.query(models.CaseSheet).all()
     cattle_lookup = {item.id: item for item in db.query(models.CattleProfile).all()}
@@ -683,20 +853,20 @@ def get_doctor_trends(db: Session = Depends(get_db), current_user: dict = Depend
     }
 
 
-@app.get("/doctor/emergency-alerts")
+@app.get("/doctor/emergency-alerts", response_model=list[dict[str, Any]])
 def get_emergency_alerts(db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin"))):
     severe_keywords = {"breathing-difficulty", "high-fever", "bleeding", "asphyxia", "convulsions", "seizures"}
     cases = db.query(models.CaseSheet).order_by(models.CaseSheet.visit_date.desc()).all()
     cattle_lookup = {item.id: item for item in db.query(models.CattleProfile).all()}
     results = []
     for case in cases:
-        case_tokens = {token.strip().lower() for token in str(case.symptoms).split(",") if token.strip()}
+        case_tokens = {token.strip().lower() for token in str(case.normalized_symptoms or case.symptoms).split(",") if token.strip()}
         if case.emergency_flag or severe_keywords.intersection(case_tokens):
             results.append(serialize_case_sheet(case, cattle_lookup.get(case.cattle_id)))
     return results
 
 
-@app.get("/doctor/similar-cases")
+@app.get("/doctor/similar-cases", response_model=list[dict[str, Any]])
 def get_similar_cases(symptoms: str, db: Session = Depends(get_db), current_user: dict = Depends(require_roles("doctor", "admin"))):
     input_tokens = {token.strip().lower() for token in symptoms.split(",") if token.strip()}
     cattle_lookup = {item.id: item for item in db.query(models.CattleProfile).all()}
@@ -712,7 +882,161 @@ def get_similar_cases(symptoms: str, db: Session = Depends(get_db), current_user
     ranked.sort(key=lambda item: item[0], reverse=True)
     return [serialize_case_sheet(case, cattle_lookup.get(case.cattle_id)) for score, case in ranked[:10]]
 
-@app.get("/analytics")
+@app.patch("/case-sheets/{case_id}/outcome")
+def update_case_outcome(
+    case_id: int,
+    payload: CaseOutcomeUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("doctor", "admin")),
+):
+    case = db.query(models.CaseSheet).filter(models.CaseSheet.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case sheet not found")
+
+    case.outcome_status = payload.outcome_status
+    case.outcome_notes = payload.outcome_notes
+    case.resolved_at = payload.resolved_at or (datetime.now(UTC) if payload.outcome_status in {"resolved", "failed"} else None)
+
+    if payload.outcome_status == "resolved":
+        case.recovery_progress = "recovered"
+        case.case_status = "closed"
+
+    db.commit()
+    db.refresh(case)
+    cattle = db.query(models.CattleProfile).filter(models.CattleProfile.id == case.cattle_id).first()
+    return serialize_case_sheet(case, cattle)
+
+
+@app.get("/cattle/{cattle_id}/timeline")
+def get_cattle_timeline(
+    cattle_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("doctor", "admin")),
+):
+    cattle = db.query(models.CattleProfile).filter(models.CattleProfile.id == cattle_id).first()
+    if not cattle:
+        raise HTTPException(status_code=404, detail="Cattle profile not found")
+
+    visits = db.query(models.CaseSheet).filter(models.CaseSheet.cattle_id == cattle_id).order_by(models.CaseSheet.visit_date.desc()).all()
+    labs = db.query(models.LabReport).filter(models.LabReport.cattle_id == cattle_id).order_by(models.LabReport.uploaded_at.desc()).all()
+
+    return {
+        "cattle": serialize_cattle(cattle),
+        "timeline": [serialize_case_sheet(item, cattle) for item in visits],
+        "lab_reports": [serialize_lab_report(item, cattle) for item in labs],
+        "summary": {
+            "visit_count": len(visits),
+            "lab_report_count": len(labs),
+            "open_cases": len([item for item in visits if item.case_status != "closed"]),
+            "resolved_cases": len([item for item in visits if item.outcome_status == "resolved"]),
+        },
+    }
+
+
+@app.get("/doctor/outcomes", response_model=dict[str, Any])
+def get_doctor_outcomes(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("doctor", "admin")),
+):
+    cases = db.query(models.CaseSheet).all()
+    cattle_lookup = {item.id: item for item in db.query(models.CattleProfile).all()}
+
+    by_disease = {}
+    by_farm = {}
+    by_season = {}
+    by_doctor = {}
+
+    for case in cases:
+        disease = (case.confirmed_disease or case.predicted_disease or case.diagnosis or "unknown").lower()
+        farm = case.farmer_id or "unknown"
+        season = season_from_date(case.visit_date)
+        doctor = case.doctor_id or "unknown"
+
+        is_success = 1 if case.outcome_status == "resolved" or case.recovery_progress == "recovered" else 0
+
+        for bucket, key in ((by_disease, disease), (by_farm, farm), (by_season, season), (by_doctor, doctor)):
+            if key not in bucket:
+                bucket[key] = {"total": 0, "success": 0}
+            bucket[key]["total"] += 1
+            bucket[key]["success"] += is_success
+
+    def _rate_map(bucket: dict) -> dict:
+        result = {}
+        for key, value in bucket.items():
+            total = value["total"]
+            success = value["success"]
+            result[key] = {
+                "total_cases": total,
+                "successful_cases": success,
+                "success_rate": round((success / total) * 100, 2) if total else 0.0,
+            }
+        return result
+
+    return {
+        "by_disease": _rate_map(by_disease),
+        "by_farm": _rate_map(by_farm),
+        "by_season": _rate_map(by_season),
+        "by_doctor": _rate_map(by_doctor),
+        "overall": {
+            "total_cases": len(cases),
+            "resolved_cases": len([c for c in cases if c.outcome_status == "resolved"]),
+        },
+    }
+
+
+@app.get("/doctor/data-quality", response_model=dict[str, Any])
+def get_data_quality(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(require_roles("doctor", "admin")),
+):
+    known = {item.lower() for item in PredictionService.SYMPTOMS}
+    cases = db.query(models.CaseSheet).order_by(models.CaseSheet.visit_date.desc()).all()
+
+    missing_fields = []
+    duplicate_candidates = []
+    invalid_symptoms = []
+
+    seen = {}
+    for case in cases:
+        key = (
+            case.cattle_id,
+            (case.normalized_symptoms or case.symptoms or "").strip().lower(),
+            case.visit_date.strftime("%Y-%m-%d"),
+        )
+        if key in seen:
+            duplicate_candidates.append({"current_case_id": case.id, "possible_duplicate_of": seen[key]})
+        else:
+            seen[key] = case.id
+
+        missing = []
+        if not case.diagnosis:
+            missing.append("diagnosis")
+        if not case.treatment:
+            missing.append("treatment")
+        if not case.confirmed_disease:
+            missing.append("confirmed_disease")
+        if missing:
+            missing_fields.append({"case_id": case.id, "missing": missing})
+
+        raw_tokens = {token.strip().lower() for token in str(case.symptoms or "").split(",") if token.strip()}
+        unknown = sorted([token for token in raw_tokens if token not in known])
+        if unknown:
+            invalid_symptoms.append({"case_id": case.id, "invalid_tokens": unknown})
+
+    return {
+        "summary": {
+            "case_count": len(cases),
+            "missing_field_cases": len(missing_fields),
+            "duplicate_candidates": len(duplicate_candidates),
+            "invalid_symptom_cases": len(invalid_symptoms),
+        },
+        "missing_fields": missing_fields,
+        "duplicate_candidates": duplicate_candidates,
+        "invalid_symptoms": invalid_symptoms,
+    }
+
+
+@app.get("/analytics", response_model=dict[str, Any])
 def get_analytics(db: Session = Depends(get_db), current_user: dict = Depends(require_roles("admin"))):
     # Calculate disease frequencies from History
     histories = db.query(models.History).all()
@@ -734,4 +1058,162 @@ def get_analytics(db: Session = Depends(get_db), current_user: dict = Depends(re
             "total_queries": query_count,
             "total_predictions": len(histories)
         }
+    }
+
+
+@app.post("/admin/demo-seed", response_model=DemoSeedResponse)
+def seed_demo_data(db: Session = Depends(get_db), current_user: dict = Depends(require_roles("admin"))):
+    created = {
+        "farmers": 0,
+        "doctors": 0,
+        "cattle_profiles": 0,
+        "case_sheets": 0,
+        "history_records": 0,
+        "queries": 0,
+    }
+    existing = {key: 0 for key in created}
+
+    farmer_id = "FMR1001"
+    doctor_id = "DOC2001"
+
+    city = db.query(models.City).filter(models.City.city_name == "Bangalore").first()
+    if not city:
+        city = models.City(city_name="Bangalore")
+        db.add(city)
+        db.commit()
+        db.refresh(city)
+
+    farmer = db.query(models.Farmer).filter(models.Farmer.farmer_id == farmer_id).first()
+    if not farmer:
+        farmer = models.Farmer(
+            farmer_id=farmer_id,
+            password=hash_password("farmer123"),
+            name="Demo Farmer",
+            contact_no="9000000001",
+            address="Village Demo, Karnataka",
+        )
+        db.add(farmer)
+        db.commit()
+        created["farmers"] += 1
+    else:
+        existing["farmers"] += 1
+
+    doctor = db.query(models.VDoctor).filter(models.VDoctor.ic_id == doctor_id).first()
+    if not doctor:
+        doctor = models.VDoctor(
+            ic_id=doctor_id,
+            password=hash_password("doctor123"),
+            name="Demo Veterinary Doctor",
+            address="Demo Clinic, Bangalore",
+            contact_no="9000000002",
+            email_id="doctor.demo@example.com",
+            city_id=city.city_id,
+        )
+        db.add(doctor)
+        db.commit()
+        created["doctors"] += 1
+    else:
+        existing["doctors"] += 1
+
+    cattle = db.query(models.CattleProfile).filter(
+        models.CattleProfile.farmer_id == farmer_id,
+        models.CattleProfile.animal_tag == "TAG-001",
+    ).first()
+    if not cattle:
+        cattle = models.CattleProfile(
+            farmer_id=farmer_id,
+            animal_tag="TAG-001",
+            animal_name="Lakshmi",
+            breed="Jersey",
+            age_years=4.0,
+            weight_kg=350.0,
+            gender="female",
+            pregnancy_status="not_pregnant",
+            milk_yield_liters=9.5,
+            village="Mandya",
+            notes="Seeded demo cattle profile.",
+        )
+        db.add(cattle)
+        db.commit()
+        db.refresh(cattle)
+        created["cattle_profiles"] += 1
+    else:
+        existing["cattle_profiles"] += 1
+
+    case = db.query(models.CaseSheet).filter(
+        models.CaseSheet.cattle_id == cattle.id,
+        models.CaseSheet.doctor_id == doctor_id,
+        models.CaseSheet.diagnosis == "Mastitis",
+    ).first()
+    if not case:
+        normalized_symptoms, unknown_symptoms = normalize_symptoms("udder-swelling,fever,milk-reduction", PredictionService.SYMPTOMS)
+        severity_score, escalation_level = severity_from_symptoms(normalized_symptoms)
+        case = models.CaseSheet(
+            cattle_id=cattle.id,
+            farmer_id=farmer_id,
+            doctor_id=doctor_id,
+            symptoms="udder-swelling,fever,milk-reduction",
+            normalized_symptoms=normalized_symptoms,
+            diagnosis="Mastitis",
+            predicted_disease="Mastitis",
+            confirmed_disease="Mastitis",
+            treatment="Antibiotic therapy, anti-inflammatory, and udder hygiene protocol",
+            dosage_notes="Adjust dose by weight and milk withdrawal advice",
+            follow_up_date=datetime.now(UTC),
+            notes="Seeded demo case sheet.",
+            recovery_progress="improving",
+            outcome_status="improving",
+            severity_score=severity_score,
+            escalation_level=escalation_level,
+            data_quality_flags=",".join(unknown_symptoms) if unknown_symptoms else "",
+            emergency_flag=escalation_level in {"high", "critical"},
+            case_status="under_review",
+        )
+        db.add(case)
+        db.commit()
+        created["case_sheets"] += 1
+    else:
+        existing["case_sheets"] += 1
+
+    history = db.query(models.History).filter(
+        models.History.farmer_id == farmer_id,
+        models.History.description == "Seeded Demo Prediction",
+    ).first()
+    if not history:
+        db.add(
+            models.History(
+                farmer_id=farmer_id,
+                description="Seeded Demo Prediction",
+                symptoms="udder-swelling,fever,milk-reduction",
+                disease="Mastitis",
+                treatments="Antibiotic + udder care",
+            )
+        )
+        db.commit()
+        created["history_records"] += 1
+    else:
+        existing["history_records"] += 1
+
+    query = db.query(models.Query).filter(
+        models.Query.farmer_id == farmer_id,
+        models.Query.query_text == "Milk output reduced after fever. What should I monitor next?",
+    ).first()
+    if not query:
+        db.add(
+            models.Query(
+                farmer_id=farmer_id,
+                query_text="Milk output reduced after fever. What should I monitor next?",
+                reply_text="Track appetite, udder heat, and milk texture. Recheck in 24 hours.",
+                reply_date=datetime.now(UTC),
+            )
+        )
+        db.commit()
+        created["queries"] += 1
+    else:
+        existing["queries"] += 1
+
+    return {
+        "message": "Demo data is ready. Use FMR1001/farmer123 and DOC2001/doctor123 for walkthrough.",
+        "created": created,
+        "existing": existing,
     }

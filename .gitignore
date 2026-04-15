@@ -1,24 +1,11 @@
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-
-# Virtual environments
+.venv/
 venv/
-backend/venv/
-frontend/venv/
-
-# Local databases and uploads
-*.db
+.env
+.env.*
+!.env.example
+backups/
+.demo_logs/
+.demo_pids/
 backend/uploads/
-
-# OS files
-.DS_Store
-
-# Streamlit
-.streamlit/
-
-# Test/coverage
-.pytest_cache/
-.coverage

@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 
 from views.config import API_URL, auth_headers
+from views.ui_helpers import api_failure, empty_state, render_section_header
 
 @st.cache_data
 def fetch_symptoms():
@@ -38,14 +39,14 @@ def render():
     tab1, tab2, tab3 = st.tabs(["🔍 Analyze Symptoms", "📋 Prediction History", "💬 Ask a Doctor"])
     
     with tab1:
-        st.subheader("Symptom Checker & Disease Prediction")
+        render_section_header("Symptom Checker & Disease Prediction", "Select or enter symptoms to generate guidance.")
 
         if "txtSymptoms" not in st.session_state:
             st.session_state["txtSymptoms"] = ""
             
         available_list = fetch_symptoms()
         if not available_list:
-            st.info("No symptoms loaded from server.")
+            empty_state("No symptoms loaded from server.")
             available_list = []
             
         st.write("### Symptoms:")
@@ -108,7 +109,7 @@ def render():
                         else:
                             st.error(f"Error from API: {response.text}")
                     except requests.exceptions.ConnectionError:
-                        st.error("Failed to connect to the backend server.")
+                        api_failure("Unable to connect to backend.")
 
     with tab2:
         st.subheader("Your Past Predictions")
@@ -126,11 +127,11 @@ def render():
                         columns = [col for col in ['date', 'symptoms', 'disease', 'treatments', 'description'] if col in df_hist.columns]
                         st.dataframe(df_hist[columns], use_container_width=True)
                     else:
-                        st.info("No prediction history found.")
+                        empty_state("No prediction history found.")
                 else:
-                    st.error("Could not load prediction history.")
+                    api_failure("Could not load prediction history.")
             except Exception:
-                st.error("Could not fetch history tracking. Is the backend running?")
+                api_failure("Could not fetch history tracking.")
             
     with tab3:
         st.subheader("Ask a Doctor / Submit a Query")
@@ -147,9 +148,9 @@ def render():
                         if res_q.status_code == 200:
                             st.success("Your question has been sent to the veterinary team!")
                         else:
-                            st.error("Failed to submit query.")
+                            api_failure("Failed to submit query.")
                     except Exception:
-                        st.error("Could not connect to backend.")
+                        api_failure("Could not connect to backend.")
                     
         st.markdown("#### Your Previous Queries")
         if farmer_id:

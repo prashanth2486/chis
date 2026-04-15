@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  backend:
+    env_file:
+      - .env.prod
+    environment:
+      - APP_ENV=prod
+  frontend:
+    env_file:
+      - .env.prod

@@ -1,18 +1,43 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: postgres:16
+    container_name: pattern_prediction_postgres
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-pattern_prediction}
+      - POSTGRES_USER=${POSTGRES_USER:-pattern_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-pattern_pass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pattern_user} -d ${POSTGRES_DB:-pattern_prediction}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
   backend:
     build:
       context: ./backend
     container_name: pattern_prediction_backend
     ports:
       - "8000:8000"
+    env_file:
+      - .env.example
     environment:
-      - CORS_ALLOWED_ORIGINS=http://localhost:8501,http://127.0.0.1:8501
-      - JWT_SECRET_KEY=change-me-in-production
-      - DEFAULT_ADMIN_PASSWORD=admin123
+      - APP_ENV=${APP_ENV:-dev}
+      - APP_NAME=${APP_NAME:-Cattle Disease Pattern Prediction API}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:8501,http://127.0.0.1:8501}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
+      - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES:-120}
+      - DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD:-admin123}
+      - DATABASE_URL=${DATABASE_URL:-postgresql+psycopg2://pattern_user:pattern_pass@postgres:5432/pattern_prediction}
     volumes:
-      - ./backend/data:/app/data
+      - ./backend/uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: always
 
   frontend:
@@ -21,8 +46,13 @@ services:
     container_name: pattern_prediction_frontend
     ports:
       - "8501:8501"
+    env_file:
+      - .env.example
     environment:
-      - PATTERN_PREDICTION_API_URL=http://backend:8000
+      - PATTERN_PREDICTION_API_URL=${PATTERN_PREDICTION_API_URL:-http://backend:8000}
     depends_on:
       - backend
     restart: always
+
+volumes:
+  postgres_data:
