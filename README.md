@@ -1,93 +1,149 @@
-# Cattle Health Intelligence System
+# Cattle Health Intelligence System (CHIS)
 
-Production-readiness baseline for a FastAPI + Streamlit cattle health platform.
+Role-based platform that helps farmers, veterinary doctors, and admins report cattle symptoms, get disease/treatment guidance, keep clinical records, and mine frequent symptom patterns.
 
-## What Was Added
-- JWT auth with bcrypt hashing and RBAC enforcement
-- Request validation hardening with Pydantic `Field` constraints + `EmailStr`
-- Pagination support on major list APIs (`limit`, `offset`)
-- Unified error schema and request-id based structured logging
-- Health endpoints: `/health`, `/ready`
-- Versioned migrations with Alembic
-- Pytest suite with unit + integration + negative tests
-- GitHub Actions CI workflow
-- Environment profiles (`.env.example`, `.env.stage`, `.env.prod`)
-- Backup/restore scripts for DB and uploads
-- Scope freeze baseline for end-to-end sign-off
+## What this project does
 
-## Local Run (venv)
+CHIS is an end-to-end cattle healthcare workflow:
 
-### Backend
-```bash
-cd /Users/prashanth/Desktop/chis/pattern_prediction/backend
-./venv/bin/python -m pip install -r requirements-dev.txt
-./venv/bin/python -m alembic -c alembic.ini upgrade head
-./venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+- **Farmers** enter symptoms, get a predicted disease and treatment hint, save history, and ask a doctor.
+- **Doctors** manage cattle profiles, case sheets, queries, lab uploads, follow-ups, and pattern mining.
+- **Admins** monitor users/analytics, seed demo data, and run dataset mining.
+
+The UI is a Streamlit portal. The API is FastAPI with JWT login and role-based access.
+
+## Problem being solved
+
+Cattle care is often fragmented: symptoms are recorded inconsistently, cases live in paper notes, follow-ups are easy to miss, and historical patterns are rarely analyzed. CHIS puts reporting, prediction support, case handling, and analytics in one system so farmers and vets can coordinate faster.
+
+This is **clinical decision support**, not a replacement for a veterinary doctor.
+
+## Technologies used
+
+| Layer | Stack |
+|---|---|
+| Frontend | Streamlit, Requests, Pandas |
+| Backend | FastAPI, Pydantic, Uvicorn |
+| Auth | JWT (`python-jose`), bcrypt (`passlib`) |
+| Database | SQLAlchemy, Alembic; SQLite (local), PostgreSQL (Docker/stage/prod) |
+| Pattern mining | mlxtend (frequent itemsets + association rules) |
+| Ops | Docker Compose, GitHub Actions, backup/restore scripts |
+
+## Dataset / source
+
+Prediction is **rule-based**, not a trained ML model. Symptom-to-disease and disease-to-treatment maps live in `backend/services/prediction_service.py` (veterinary knowledge rules).
+
+Pattern mining uses transaction CSVs with a `Data` column of comma-separated symptoms:
+
+- `sample_dataset.csv` — tiny example
+- `realistic_cattle_dataset.csv` — synthetic cattle-symptom dataset (~200 rows) created for this project
+
+Upload either file (or Excel) to `/eclat/run` to get frequent itemsets and association rules.
+
+## How the project works
+
+```
+Farmer / Doctor / Admin
+        |
+        v
+ Streamlit UI  -- JWT Bearer -->  FastAPI
+                                        |
+                    +-------------------+-------------------+
+                    v                   v                   v
+             Prediction rules      Eclat mining         SQLAlchemy
+             (symptoms → disease)  (CSV/Excel)          SQLite / Postgres
 ```
 
-### Frontend
+1. User logs in or registers. Backend issues a JWT; the UI sends it on later calls.
+2. RBAC blocks endpoints the role is not allowed to use (for example, only doctor/admin create cattle profiles).
+3. `/predict` tokenizes symptoms, matches them to disease rules, and returns a treatment mapping.
+4. Doctors store cattle, case sheets (predicted vs confirmed diagnosis), outcomes, and lab files.
+5. Admins/doctors can upload a dataset and run frequent-pattern mining (support/confidence thresholds).
+
+## How to run it
+
+**Requirements:** Python 3.13+, optionally Docker.
+
+Clone and configure (placeholders only — do not commit `.env`):
+
 ```bash
-cd /Users/prashanth/Desktop/chis/pattern_prediction/frontend
-./venv/bin/python -m pip install -r requirements.txt
-./venv/bin/python -m streamlit run app.py --server.address 127.0.0.1 --server.port 8501
+git clone https://github.com/prashanth2486/chis.git
+cd chis
+cp .env.example .env
 ```
 
-## Local Run (Docker Compose with PostgreSQL)
+### Option A — local (venv)
+
+Backend:
+
 ```bash
-cd /Users/prashanth/Desktop/chis/pattern_prediction
+cd backend
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements-dev.txt
+alembic -c alembic.ini upgrade head
+uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+Frontend (second terminal):
+
+```bash
+cd frontend
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py --server.address 127.0.0.1 --server.port 8501
+```
+
+### Option B — Docker Compose
+
+```bash
 docker compose up -d --build
 docker compose exec backend alembic -c alembic.ini upgrade head
 ```
 
-## Tests
+### Tests
+
 ```bash
-cd /Users/prashanth/Desktop/chis/pattern_prediction/backend
-./venv/bin/python -m pytest -q
+cd backend
+pytest -q
 ```
 
-## Backup / Restore
+### URLs
 
-### Default (local SQLite from `.env.example`)
-```bash
-cd /Users/prashanth/Desktop/chis/pattern_prediction
-./scripts/backup.sh
-./scripts/restore.sh /path/to/pattern_prediction_YYYYMMDD_HHMMSS.db /path/to/uploads_YYYYMMDD_HHMMSS.tar.gz
-```
+- UI: http://127.0.0.1:8501
+- API: http://127.0.0.1:8000
+- Swagger: http://127.0.0.1:8000/docs
+- Health: `GET /health` · Ready: `GET /ready`
 
-### Stage/Prod PostgreSQL
-```bash
-cd /Users/prashanth/Desktop/chis/pattern_prediction
-ENV_PROFILE_FILE=.env.prod ./scripts/backup.sh
-ENV_PROFILE_FILE=.env.prod ./scripts/restore.sh /path/to/pattern_prediction_YYYYMMDD_HHMMSS.sql.gz /path/to/uploads_YYYYMMDD_HHMMSS.tar.gz
-```
+After first start, register a farmer/doctor, or log in as admin using the local password from your `.env` (`DEFAULT_ADMIN_PASSWORD` in `.env.example`). Change it before any real deployment. Admins can also call `POST /admin/demo-seed` to create walkthrough data.
 
-Notes:
-- You can always override by exporting `DATABASE_URL` explicitly.
-- PostgreSQL backup/restore requires `pg_dump` and `psql` on the host.
+## Results / output
 
-## Deployment Smoke Test
-```bash
-./scripts/smoke_test.sh
-```
-Optional:
-```bash
-API_URL=https://api.example.com FRONTEND_URL=https://app.example.com ./scripts/smoke_test.sh
-SMOKE_ADMIN_PASSWORD='your-admin-password' ./scripts/smoke_test.sh
-```
+| Output | Where |
+|---|---|
+| Predicted disease + treatment | Farmer/doctor dashboards; `POST /predict` |
+| Saved prediction history | Farmer history; `GET /history/{farmer_id}` |
+| Case sheets, timelines, outcomes | Doctor dashboard |
+| Frequent itemsets + association rules | Admin/doctor Eclat screen; `POST /eclat/run` |
+| Platform KPIs | Admin analytics; `GET /analytics` |
+| API contract | http://127.0.0.1:8000/docs |
 
-## Dependency Lock Strategy
-- Runtime dependencies are pinned in:
-  - `backend/requirements.txt`
-  - `frontend/requirements.txt`
-- Dev/test dependencies are pinned in:
-  - `backend/requirements-dev.txt`
-- CI installs pinned files directly for reproducible builds.
+Example: symptoms `fever,coughing,nasal-discharge` can map to a respiratory disease such as pneumonia, with the matching treatment guidance. Eclat on `realistic_cattle_dataset.csv` returns co-occurring symptom sets (for example fever with reduced appetite) and rules with confidence scores.
 
-## Presentation Docs
-- Scope freeze: `docs/SCOPE_FREEZE.md`
-- Architecture: `docs/ARCHITECTURE.md`
-- Deployment runbook: `docs/DEPLOYMENT_RUNBOOK.md`
-- API endpoints: `docs/API_ENDPOINTS.md`
-- UAT checklist: `docs/UAT_CHECKLIST.md`
-- Project brief: `docs/PROJECT_BRIEF.md`
-- Demo checklist: `docs/DEMO_CHECKLIST.md`
+## Your contribution
+
+Solo project covering the full stack:
+
+- Role-based Streamlit portals (farmer, doctor, admin)
+- FastAPI backend with JWT, RBAC, Pydantic validation, and pagination
+- Clinical workflow: cattle registry, case sheets, queries, lab uploads, follow-ups
+- Rule-based cattle disease prediction and treatment mapping
+- Eclat-style frequent pattern mining on symptom datasets
+- SQLAlchemy models + Alembic migrations (SQLite / PostgreSQL)
+- Docker Compose, CI tests, health checks, and backup/restore scripts
+
+## Repository hygiene
+
+- Secrets belong in a local `.env` (gitignored). Only `.env.example` is committed, with placeholders.
+- Do not commit `*.db`, `.env`, API keys, or real user data.

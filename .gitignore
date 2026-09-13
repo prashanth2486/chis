@@ -9,3 +9,5 @@ backups/
 .demo_logs/
 .demo_pids/
 backend/uploads/
+*.db
+.DS_Store
